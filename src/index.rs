@@ -191,8 +191,7 @@ impl Index {
         let build_config = BuildConfig::default();
         let query_config = QueryConfig::default();
         let api_config = ApiConfig::default();
-        let api_config_raw = ApiConfigRaw::default();
-
+        
         let mut result = Index {
             ragit_version: crate::VERSION.to_string(),
             chunk_count: 0,
@@ -201,7 +200,7 @@ impl Index {
             curr_processing_file: None,
             build_config,
             query_config,
-            api_config_raw,
+            api_config_raw: ApiConfigRaw::default(), // Temporary default, will be updated after loading models
             api_config,
             root_dir,
             repo_url: None,
@@ -210,7 +209,11 @@ impl Index {
             models: vec![],
         };
 
+        // Load models first so we can choose an appropriate default model
         result.load_or_init_models()?;
+        
+        // Now update api_config_raw with a valid model
+        result.api_config_raw = result.get_default_api_config_raw()?;
         write_bytes(
             &result.get_build_config_path()?,
             &serde_json::to_vec_pretty(&result.build_config)?,
@@ -250,9 +253,34 @@ impl Index {
         result.api_config_raw = serde_json::from_str::<ApiConfigRaw>(
             &read_string(&result.get_api_config_path()?)?,
         )?;
-        result.api_config = result.init_api_config(&result.api_config_raw)?;
+        
+        // Load models before initializing API config to ensure we can validate the model
         result.load_or_init_prompts()?;
         result.load_or_init_models()?;
+        
+        // Check if the model in api_config_raw exists in the loaded models
+        let model_exists = result.models.iter().any(|m| m.name == result.api_config_raw.model);
+        
+        if !model_exists && !result.models.is_empty() {
+            // Find the lowest-cost model and update api_config_raw
+            if let Some(lowest_cost_model) = result.find_lowest_cost_model() {
+                eprintln!("Warning: Model '{}' not found in models.json. Using lowest-cost model '{}' instead.", 
+                         result.api_config_raw.model, lowest_cost_model.name);
+                
+                // Update the model in the config
+                result.api_config_raw.model = lowest_cost_model.name.clone();
+                
+                // Save the updated config
+                write_bytes(
+                    &result.get_api_config_path()?,
+                    &serde_json::to_vec_pretty(&result.api_config_raw)?,
+                    WriteMode::Atomic,
+                )?;
+            }
+        }
+        
+        // Now initialize the API config with the validated model
+        result.api_config = result.init_api_config(&result.api_config_raw)?;
 
         match load_mode {
             LoadMode::QuickCheck if result.curr_processing_file.is_some() => {
@@ -817,14 +845,21 @@ impl Index {
         )?;
 
         if !exists(&models_at) {
-            let default_models = ModelRaw::default_models();
+            // Initialize models from an external source or defaults
+            let models = self.get_initial_models()?;
+            
+            // Always ensure API keys are null in the local models file
+            let models_without_api_keys = self.remove_api_keys_from_models(models);
+            
+            // Write the models to the local file
             write_string(
                 &models_at,
-                &serde_json::to_string_pretty(&default_models)?,
+                &serde_json::to_string_pretty(&models_without_api_keys)?,
                 WriteMode::Atomic,
             )?;
         }
 
+        // Load models from the local file
         let j = read_string(&models_at)?;
         let models = serde_json::from_str::<Vec<ModelRaw>>(&j)?;
         let mut result = vec![];
@@ -835,6 +870,66 @@ impl Index {
 
         self.models = result;
         Ok(())
+    }
+    
+    // Get initial models from environment variable, config file, or defaults
+    fn get_initial_models(&self) -> Result<Vec<ModelRaw>, Error> {
+        // Check for environment variable RAGIT_MODEL_CONFIG
+        if let Ok(env_path) = std::env::var("RAGIT_MODEL_CONFIG") {
+            if exists(&env_path) {
+                // Load from the environment variable path
+                let env_content = read_string(&env_path)?;
+                if let Ok(models) = serde_json::from_str::<Vec<ModelRaw>>(&env_content) {
+                    return Ok(models);
+                } else {
+                    eprintln!("Warning: Could not parse models from RAGIT_MODEL_CONFIG, falling back to defaults");
+                }
+            } else {
+                eprintln!("Warning: RAGIT_MODEL_CONFIG points to non-existent file: {}", env_path);
+            }
+        }
+        
+        // Check for ~/.config/ragit/models.json
+        let home_dir = match std::env::var("HOME") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Warning: HOME environment variable not set, cannot check ~/.config/ragit/models.json");
+                String::new()
+            }
+        };
+        
+        if !home_dir.is_empty() {
+            let config_path = join3(&home_dir, ".config/ragit", "models.json")?;
+            if exists(&config_path) {
+                // Load from ~/.config/ragit/models.json
+                let config_content = read_string(&config_path)?;
+                if let Ok(models) = serde_json::from_str::<Vec<ModelRaw>>(&config_content) {
+                    return Ok(models);
+                } else {
+                    eprintln!("Warning: Could not parse models from ~/.config/ragit/models.json, falling back to defaults");
+                }
+            }
+        }
+        
+        // Fall back to default models
+        Ok(ModelRaw::default_models())
+    }
+    
+    // Remove API keys from models to ensure they're not stored in the local file
+    fn remove_api_keys_from_models(&self, models: Vec<ModelRaw>) -> Vec<ModelRaw> {
+        models.into_iter().map(|model| {
+            // First convert ModelRaw to Model
+            if let Ok(mut model_obj) = Model::try_from(&model) {
+                // Create a new Model with api_key set to None
+                model_obj.api_key = None;
+                // Convert back to ModelRaw
+                ModelRaw::from(&model_obj)
+            } else {
+                // If conversion fails, return the original model
+                // This shouldn't happen in practice
+                model
+            }
+        }).collect()
     }
 
     pub(crate) fn get_model_by_name(&self, name: &str) -> Result<Model, Error> {
@@ -917,5 +1012,40 @@ impl Index {
         let j = read_string(&Index::get_uid_path(&self.root_dir, IMAGE_DIR_NAME, uid, Some("json"))?)?;
         let v = serde_json::from_str::<ImageDescription>(&j)?;
         Ok(v)
+    }
+
+    /// Finds the lowest-cost model in the loaded models.
+    fn find_lowest_cost_model(&self) -> Option<&Model> {
+        if self.models.is_empty() {
+            return None;
+        }
+        
+        self.models.iter()
+            .min_by(|a, b| {
+                let a_cost = a.dollars_per_1b_input_tokens as u128 + a.dollars_per_1b_output_tokens as u128;
+                let b_cost = b.dollars_per_1b_input_tokens as u128 + b.dollars_per_1b_output_tokens as u128;
+                a_cost.cmp(&b_cost)
+            })
+    }
+    
+    /// Returns a default ApiConfigRaw with a valid model.
+    /// If the default model from ApiConfigRaw::default() doesn't exist in the loaded models,
+    /// it selects the lowest-cost model instead.
+    fn get_default_api_config_raw(&self) -> Result<ApiConfigRaw, Error> {
+        let mut config = ApiConfigRaw::default();
+        
+        // Check if the default model exists in the loaded models
+        let default_model_exists = self.models.iter().any(|m| m.name == config.model);
+        
+        if !default_model_exists && !self.models.is_empty() {
+            // Find the lowest-cost model
+            if let Some(lowest_cost_model) = self.find_lowest_cost_model() {
+                // Update the model in the config
+                config.model = lowest_cost_model.name.clone();
+                eprintln!("Warning: Default model not found in models.json. Using lowest-cost model '{}' instead.", config.model);
+            }
+        }
+        
+        Ok(config)
     }
 }
