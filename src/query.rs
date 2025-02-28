@@ -13,7 +13,7 @@ use ragit_pdl::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-mod config;
+pub mod config;
 mod keyword;
 
 pub use config::QueryConfig;

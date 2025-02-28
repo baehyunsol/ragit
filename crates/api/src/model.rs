@@ -54,20 +54,95 @@ impl Model {
     }
 
     pub fn get_api_key(&self) -> Result<String, Error> {
-        match &self.api_key {
-            Some(key) => Ok(key.to_string()),
-            None => match &self.api_env_var {
-                Some(var) => match std::env::var(var) {
-                    Ok(key) => Ok(key.to_string()),
-                    Err(_) => Err(Error::ApiKeyNotFound { env_var: Some(var.to_string()) }),
-                },
-
-                // If both `api_key` and `api_env_var` are not set,
-                // it assumes that the model does not require an
-                // api key.
-                None => Ok(String::new()),
-            },
+        // First, check if the API key is directly set in the model
+        if let Some(key) = &self.api_key {
+            return Ok(key.to_string());
         }
+        
+        // Next, check if an environment variable is specified and try to get the API key from it
+        if let Some(var) = &self.api_env_var {
+            if let Ok(key) = std::env::var(var) {
+                return Ok(key.to_string());
+            }
+            
+            // Don't return an error yet, try the other methods first
+        }
+        
+        // If we get here, try to find the API key in external model files
+        if let Some(key) = self.find_api_key_in_external_files()? {
+            return Ok(key);
+        }
+        
+        // If we have an api_env_var but couldn't find the key anywhere, return an error
+        if let Some(var) = &self.api_env_var {
+            return Err(Error::ApiKeyNotFound { env_var: Some(var.to_string()) });
+        }
+        
+        // If both `api_key` and `api_env_var` are not set,
+        // it assumes that the model does not require an
+        // api key.
+        Ok(String::new())
+    }
+    
+    fn find_api_key_in_external_files(&self) -> Result<Option<String>, Error> {
+        // Try to find the API key in the file indicated by RAGIT_MODEL_FILE
+        if let Ok(file_path) = std::env::var("RAGIT_MODEL_FILE") {
+            if let Some(key) = self.find_api_key_in_file(&file_path)? {
+                return Ok(Some(key));
+            }
+        }
+        
+        // Try to find the API key in ~/.config/ragit/models.json
+        if let Ok(home_dir) = std::env::var("HOME") {
+            let config_path = format!("{}/.config/ragit/models.json", home_dir);
+            if let Some(key) = self.find_api_key_in_file(&config_path)? {
+                return Ok(Some(key));
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    fn find_api_key_in_file(&self, file_path: &str) -> Result<Option<String>, Error> {
+        use std::fs::File;
+        use std::io::Read;
+        
+        // Check if the file exists
+        let file = match File::open(file_path) {
+            Ok(file) => file,
+            Err(_) => return Ok(None), // File doesn't exist or can't be opened
+        };
+        
+        // Read the file content
+        let mut content = String::new();
+        if let Err(_) = file.take(10_000_000).read_to_string(&mut content) {
+            return Ok(None); // Can't read the file
+        }
+        
+        // Parse the JSON
+        let models: Vec<ModelRaw> = match serde_json::from_str(&content) {
+            Ok(models) => models,
+            Err(_) => return Ok(None), // Can't parse the JSON
+        };
+        
+        // Find the model with the same name
+        for model in models {
+            if model.name == self.name {
+                // If the model has an API key, return it
+                if let Some(key) = model.api_key {
+                    return Ok(Some(key));
+                }
+                
+                // If the model has an environment variable, try to get the API key from it
+                if let Some(var) = model.api_env_var {
+                    if let Ok(key) = std::env::var(&var) {
+                        return Ok(Some(key));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
     }
 
     pub fn default_models() -> Vec<Model> {

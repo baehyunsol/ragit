@@ -124,11 +124,31 @@ Now we have 1 empty knowledge-base and 3 complete knowledge-bases in the playgro
 
 Before asking a question or building a knowledge-base, you may want to change configurations. Configurations are very important because most commands cost money and you can optimize it with proper configurations.
 
+### Per-Repository Configuration
+
 Run `rag config --get model`. You'll see which model is used to answer your queries and build a knowledge-base.
 
 Let's say you have free credits for Anthropic. By running `rag config --set model claude-3.5-sonnet`, you can change your default model.
 
 Run `rag config --get-all` to see all the keys and values.
+
+### Global Configuration
+
+If you want to set default configurations for all your repositories, you can create configuration files in `~/.config/ragit/`:
+
+- `~/.config/ragit/api.json` - For API configuration (model, timeout, etc.)
+- `~/.config/ragit/build.json` - For build configuration (chunk size, etc.)
+- `~/.config/ragit/query.json` - For query configuration (max titles, etc.)
+
+These files can contain just the specific fields you want to override - you don't need to include all configuration options. For example, if you only want to set a default model, your `~/.config/ragit/api.json` could be as simple as:
+
+```json
+{
+  "model": "claude-3.5-sonnet"
+}
+```
+
+When you run `rag init` to create a new repository, these global configurations will be used as defaults. This is especially useful if you always want to use a specific model or have specific build parameters.
 
 ## 4. Build an inverted-index
 

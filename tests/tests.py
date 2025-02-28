@@ -24,6 +24,7 @@ from merge import merge
 from meta import meta
 from migrate import migrate
 from migrate2 import migrate2
+from models_init import models_init
 from orphan_process import orphan_process
 from prompts import prompts
 from ragit_api import ragit_api
@@ -226,6 +227,10 @@ Commands
 
     cargo_tests                 run `cargo test` on all the crates
 
+    models_init                 run `models_init` test
+                                It tests the initialization of models.json and
+                                model selection in api.json.
+
     all                         run all tests
                                 It dumps the test result to `tests/results.json`.
 """
@@ -388,6 +393,9 @@ if __name__ == "__main__":
 
         elif command == "cargo_tests":
             cargo_tests()
+            
+        elif command == "models_init":
+            models_init()
 
         elif command == "all":
             import json
@@ -438,6 +446,7 @@ if __name__ == "__main__":
                 ("orphan_process llama3.3-70b", lambda: orphan_process(test_model="llama3.3-70b")),
                 ("write_lock llama3.3-70b", lambda: write_lock(test_model="llama3.3-70b")),
                 ("ragit_api command-r", lambda: ragit_api(test_model="command-r")),
+                ("models_init", models_init),
                 ("migrate", migrate),
                 ("migrate2", migrate2),
             ]

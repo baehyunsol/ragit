@@ -34,6 +34,7 @@ use ragit_fs::{
     is_dir,
     join,
     join3,
+    join4,
     normalize,
     parent,
     read_bytes,
@@ -188,11 +189,41 @@ impl Index {
             )?)?;
         }
 
-        let build_config = BuildConfig::default();
-        let query_config = QueryConfig::default();
+        // Start with default configs
+        let mut build_config = BuildConfig::default();
+        let mut query_config = QueryConfig::default();
         let api_config = ApiConfig::default();
-        let api_config_raw = ApiConfigRaw::default();
-
+        
+        // Create a temporary Index to use for loading configs from home
+        let temp_index = Index {
+            ragit_version: crate::VERSION.to_string(),
+            chunk_count: 0,
+            staged_files: vec![],
+            processed_files: HashMap::new(),
+            curr_processing_file: None,
+            build_config: build_config.clone(),
+            query_config: query_config.clone(),
+            api_config_raw: ApiConfigRaw::default(),
+            api_config: api_config.clone(),
+            root_dir: root_dir.clone(),
+            repo_url: None,
+            ii_status: IIStatus::None,
+            prompts: PROMPTS.clone(),
+            models: vec![],
+        };
+        
+        // Try to load build config from home directory and apply to defaults
+        if let Ok(Some(partial_build_config)) = temp_index.load_build_config_from_home() {
+            // Apply partial config to the default config
+            partial_build_config.apply_to(&mut build_config);
+        }
+        
+        // Try to load query config from home directory and apply to defaults
+        if let Ok(Some(partial_query_config)) = temp_index.load_query_config_from_home() {
+            // Apply partial config to the default config
+            partial_query_config.apply_to(&mut query_config);
+        }
+        
         let mut result = Index {
             ragit_version: crate::VERSION.to_string(),
             chunk_count: 0,
@@ -201,7 +232,7 @@ impl Index {
             curr_processing_file: None,
             build_config,
             query_config,
-            api_config_raw,
+            api_config_raw: ApiConfigRaw::default(), // Temporary default, will be updated after loading models
             api_config,
             root_dir,
             repo_url: None,
@@ -210,7 +241,11 @@ impl Index {
             models: vec![],
         };
 
+        // Load models first so we can choose an appropriate default model
         result.load_or_init_models()?;
+        
+        // Now update api_config_raw with a valid model
+        result.api_config_raw = result.get_default_api_config_raw()?;
         write_bytes(
             &result.get_build_config_path()?,
             &serde_json::to_vec_pretty(&result.build_config)?,
@@ -250,9 +285,34 @@ impl Index {
         result.api_config_raw = serde_json::from_str::<ApiConfigRaw>(
             &read_string(&result.get_api_config_path()?)?,
         )?;
-        result.api_config = result.init_api_config(&result.api_config_raw)?;
+        
+        // Load models before initializing API config to ensure we can validate the model
         result.load_or_init_prompts()?;
         result.load_or_init_models()?;
+        
+        // Check if the model in api_config_raw exists in the loaded models
+        let model_exists = ragit_api::get_model_by_name(&result.models, &result.api_config_raw.model).is_ok();
+        
+        if !model_exists && !result.models.is_empty() {
+            // Find the lowest-cost model and update api_config_raw
+            if let Some(lowest_cost_model) = result.find_lowest_cost_model() {
+                eprintln!("Warning: Model '{}' not found in models.json. Using lowest-cost model '{}' instead.", 
+                         result.api_config_raw.model, lowest_cost_model.name);
+                
+                // Update the model in the config
+                result.api_config_raw.model = lowest_cost_model.name.clone();
+                
+                // Save the updated config
+                write_bytes(
+                    &result.get_api_config_path()?,
+                    &serde_json::to_vec_pretty(&result.api_config_raw)?,
+                    WriteMode::Atomic,
+                )?;
+            }
+        }
+        
+        // Now initialize the API config with the validated model
+        result.api_config = result.init_api_config(&result.api_config_raw)?;
 
         match load_mode {
             LoadMode::QuickCheck if result.curr_processing_file.is_some() => {
@@ -817,14 +877,21 @@ impl Index {
         )?;
 
         if !exists(&models_at) {
-            let default_models = ModelRaw::default_models();
+            // Initialize models from an external source or defaults
+            let models = self.get_initial_models()?;
+            
+            // Always ensure API keys are null in the local models file
+            let models_without_api_keys = self.remove_api_keys_from_models(models);
+            
+            // Write the models to the local file
             write_string(
                 &models_at,
-                &serde_json::to_string_pretty(&default_models)?,
+                &serde_json::to_string_pretty(&models_without_api_keys)?,
                 WriteMode::Atomic,
             )?;
         }
 
+        // Load models from the local file
         let j = read_string(&models_at)?;
         let models = serde_json::from_str::<Vec<ModelRaw>>(&j)?;
         let mut result = vec![];
@@ -835,6 +902,66 @@ impl Index {
 
         self.models = result;
         Ok(())
+    }
+    
+    // Get initial models from environment variable, config file, or defaults
+    fn get_initial_models(&self) -> Result<Vec<ModelRaw>, Error> {
+        // Check for environment variable RAGIT_MODEL_CONFIG
+        if let Ok(env_path) = std::env::var("RAGIT_MODEL_CONFIG") {
+            if exists(&env_path) {
+                // Load from the environment variable path
+                let env_content = read_string(&env_path)?;
+                if let Ok(models) = serde_json::from_str::<Vec<ModelRaw>>(&env_content) {
+                    return Ok(models);
+                } else {
+                    eprintln!("Warning: Could not parse models from RAGIT_MODEL_CONFIG, falling back to defaults");
+                }
+            } else {
+                eprintln!("Warning: RAGIT_MODEL_CONFIG points to non-existent file: {}", env_path);
+            }
+        }
+        
+        // Check for ~/.config/ragit/models.json
+        let home_dir = match std::env::var("HOME") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Warning: HOME environment variable not set, cannot check ~/.config/ragit/models.json");
+                String::new()
+            }
+        };
+        
+        if !home_dir.is_empty() {
+            let config_path = join4(&home_dir, ".config", "ragit", "models.json")?;
+            if exists(&config_path) {
+                // Load from ~/.config/ragit/models.json
+                let config_content = read_string(&config_path)?;
+                if let Ok(models) = serde_json::from_str::<Vec<ModelRaw>>(&config_content) {
+                    return Ok(models);
+                } else {
+                    eprintln!("Warning: Could not parse models from ~/.config/ragit/models.json, falling back to defaults");
+                }
+            }
+        }
+        
+        // Fall back to default models
+        Ok(ModelRaw::default_models())
+    }
+    
+    // Remove API keys from models to ensure they're not stored in the local file
+    fn remove_api_keys_from_models(&self, models: Vec<ModelRaw>) -> Vec<ModelRaw> {
+        models.into_iter().map(|model| {
+            // First convert ModelRaw to Model
+            if let Ok(mut model_obj) = Model::try_from(&model) {
+                // Create a new Model with api_key set to None
+                model_obj.api_key = None;
+                // Convert back to ModelRaw
+                ModelRaw::from(&model_obj)
+            } else {
+                // If conversion fails, return the original model
+                // This shouldn't happen in practice
+                model
+            }
+        }).collect()
     }
 
     pub(crate) fn get_model_by_name(&self, name: &str) -> Result<Model, Error> {
@@ -917,5 +1044,113 @@ impl Index {
         let j = read_string(&Index::get_uid_path(&self.root_dir, IMAGE_DIR_NAME, uid, Some("json"))?)?;
         let v = serde_json::from_str::<ImageDescription>(&j)?;
         Ok(v)
+    }
+
+    /// Finds the lowest-cost model in the loaded models.
+    fn find_lowest_cost_model(&self) -> Option<&Model> {
+        if self.models.is_empty() {
+            return None;
+        }
+        
+        self.models.iter()
+            .min_by(|a, b| {
+                let a_cost = a.dollars_per_1b_input_tokens as u128 + a.dollars_per_1b_output_tokens as u128;
+                let b_cost = b.dollars_per_1b_input_tokens as u128 + b.dollars_per_1b_output_tokens as u128;
+                a_cost.cmp(&b_cost)
+            })
+    }
+    
+    /// Attempts to load a config file from ~/.config/ragit/
+    fn load_config_from_home<T: serde::de::DeserializeOwned>(&self, filename: &str) -> Result<Option<T>, Error> {
+        // Check for HOME environment variable
+        let home_dir = match std::env::var("HOME") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Warning: HOME environment variable not set, cannot check ~/.config/ragit/{}", filename);
+                return Ok(None);
+            }
+        };
+        
+        let config_path = join4(&home_dir, ".config", "ragit", filename)?;
+        if exists(&config_path) {
+            // Load from ~/.config/ragit/filename
+            let config_content = read_string(&config_path)?;
+            match serde_json::from_str::<T>(&config_content) {
+                Ok(config) => {
+                    eprintln!("Info: Using configuration from ~/.config/ragit/{}", filename);
+                    return Ok(Some(config));
+                },
+                Err(e) => {
+                    eprintln!("Warning: Could not parse {} from ~/.config/ragit/{}: {}", filename, filename, e);
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+
+    /// Attempts to load ApiConfigRaw from ~/.config/ragit/api.json
+    fn load_api_config_from_home(&self) -> Result<Option<ApiConfigRaw>, Error> {
+        self.load_config_from_home("api.json")
+    }
+    
+    /// Attempts to load PartialQueryConfig from ~/.config/ragit/query.json
+    fn load_query_config_from_home(&self) -> Result<Option<crate::query::config::PartialQueryConfig>, Error> {
+        self.load_config_from_home("query.json")
+    }
+    
+    /// Attempts to load PartialBuildConfig from ~/.config/ragit/build.json
+    fn load_build_config_from_home(&self) -> Result<Option<crate::index::config::PartialBuildConfig>, Error> {
+        self.load_config_from_home("build.json")
+    }
+
+    /// Returns a default ApiConfigRaw with a valid model.
+    /// If ~/.config/ragit/api.json exists, values from there will override the defaults.
+    /// If the default model doesn't exist in the loaded models,
+    /// it selects the lowest-cost model instead.
+    fn get_default_api_config_raw(&self) -> Result<ApiConfigRaw, Error> {
+        // Start with default config
+        let mut config = ApiConfigRaw::default();
+        
+        // Try to load config from home directory
+        if let Ok(Some(home_config)) = self.load_api_config_from_home() {
+            // Override default values with values from home config
+            if home_config.api_key.is_some() {
+                config.api_key = home_config.api_key;
+            }
+            
+            if !home_config.model.is_empty() {
+                config.model = home_config.model;
+            }
+            
+            if home_config.timeout.is_some() {
+                config.timeout = home_config.timeout;
+            }
+            
+            config.sleep_between_retries = home_config.sleep_between_retries;
+            config.max_retry = home_config.max_retry;
+            
+            if home_config.sleep_after_llm_call.is_some() {
+                config.sleep_after_llm_call = home_config.sleep_after_llm_call;
+            }
+            
+            config.dump_log = home_config.dump_log;
+            config.dump_api_usage = home_config.dump_api_usage;
+        }
+        
+        // Check if the model exists in the loaded models
+        let model_exists = ragit_api::get_model_by_name(&self.models, &config.model).is_ok();
+        
+        if !model_exists && !self.models.is_empty() {
+            // Find the lowest-cost model
+            if let Some(lowest_cost_model) = self.find_lowest_cost_model() {
+                // Update the model in the config
+                config.model = lowest_cost_model.name.clone();
+                eprintln!("Warning: Model '{}' not found in models.json. Using lowest-cost model '{}' instead.", 
+                         config.model, lowest_cost_model.name);
+            }
+        }
+        
+        Ok(config)
     }
 }

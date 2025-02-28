@@ -2,6 +2,15 @@
 
 In order to add/remove/edit language models, you have to modify `.ragit/models.json`. Below is the schema of the file.
 
+## Custom Model Configuration
+
+You can provide a custom models.json file in two ways:
+
+1. Set the environment variable `RAGIT_MODEL_CONFIG` to the path of your custom models.json file.
+2. Place a models.json file in `~/.config/ragit/models.json`.
+
+When initializing a new ragit repository, it will check these locations in the order listed above before falling back to the default models. This allows you to have a consistent set of models across all your ragit repositories.
+
 ```rust
 struct ModelRaw {
     /// Model name shown to user.
